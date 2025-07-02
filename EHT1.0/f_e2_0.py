@@ -1,0 +1,102 @@
+import prefabricationField
+import autograd.numpy as np
+import os
+from pathlib import Path
+from tqdm import tqdm
+from joblib import Parallel, delayed
+import time
+
+interpolator = prefabricationField.interpolator()
+xi_interpolator_jet = interpolator.xi_interpolator_jet()
+xi_interpolator_disk = interpolator.xi_interpolator_disk()
+
+def save_fe(path, ii, jj, data):
+    outfile = Path(path) / "f_e" / f"r_{ii}" / f"theta_{jj}.npy"
+    os.makedirs(outfile.parent, exist_ok=True)
+    np.save(outfile, data)
+
+def compute_fe(ii, jj, r, theta, mDM, sigv, spec, p0_vals, ll, cutoff_data, p_inj_folder, classify, parame, phy, vel, rho, dm_spectrum):
+    region = classify.classify(r, theta)
+    if region == 'jet-disk':
+        out = np.zeros((ll, 2), dtype=float)
+        out[:, 0] = p0_vals
+        save_fe(Path.cwd(), ii, jj, out)
+        return
+
+    if region == 'jet':
+        phi = phy.Phi(r, theta)
+        thetaInj = phy.theta_inj_jet
+        vR = vel.v_jet
+        xi = xi_interpolator_jet
+    else:
+        thetaInj = phy.theta_stag
+        vR = vel.v_disk
+        xi = xi_interpolator_disk
+
+    pinjtab = np.load(p_inj_folder / f"r_{ii}" / f"theta_{jj}.npy")
+    nrows = pinjtab.shape[0]
+    nblocks = nrows // ll
+
+    fe = np.zeros((ll, 2), dtype=float)
+    for vari in range(ll):
+        p0 = pinjtab[vari * nblocks, 0]
+        total = 0.0
+        for m in range(ll - 1):
+            idx = vari * ll + m
+            r_inj = pinjtab[idx, 1]
+            dr = abs(r_inj - pinjtab[idx + 1, 1])
+            p_inj = pinjtab[idx, 2]
+            if region == 'jet':
+                theta_inj = thetaInj(r_inj, phi)
+            else:
+                theta_inj = thetaInj(r, theta, r_inj)
+            vR_inj = vR(r_inj, theta_inj)
+
+            term = (parame.pc2cm / (parame.c * 8 * np.pi)) * ((sigv * rho(r_inj, theta_inj) ** 2) / (p_inj ** 2 * mDM ** 2)) * dm_spectrum.evaluate(p_inj)
+            term *= (1 / vR_inj) * (p_inj / p0) ** 4 * (xi(r, theta) / xi(r_inj, theta_inj)) ** 4
+            term *= dr
+            total += term
+        fe[vari] = (p0, total)
+
+    save_fe(Path.cwd(), ii, jj, fe)
+
+def calculatefe(mDM, sigv, spec):
+    start_time = time.time()
+
+    classify = prefabricationField.RegionClassifier()
+    parame = prefabricationField.Parameters()
+    phy = prefabricationField.Physics()
+    vel = prefabricationField.Velocity()
+    rho = prefabricationField.BH_halo(a_J=0.9375, m_DM=mDM, sigv=sigv).rho
+    path = Path.cwd()
+    dm_spectrum = prefabricationField.DMSpectrum(str(path), mDM, sigv, spec)
+
+    cutoff_data = np.load(path / "cutoffPoint.npy")
+    p_inj_folder = path / ("p_inj" if mDM > 1 else "p_inj_subGeV")
+    r_vals = np.unique(cutoff_data[..., 0])
+    theta_vals = np.unique(cutoff_data[..., 1])
+    p0_vals = np.unique(cutoff_data[..., 2])
+    nn = len(r_vals) - 1
+    mm = len(theta_vals) - 1
+    ll = len(p0_vals)
+
+    tasks = [
+        (ii, jj, r, theta)
+        for ii, r in enumerate(r_vals, start=1)
+        for jj, theta in enumerate(theta_vals, start=1)
+    ]
+
+    Parallel(n_jobs=-1)(
+        delayed(compute_fe)(
+            ii, jj, r, theta, mDM, sigv, spec, p0_vals, ll,
+            cutoff_data, p_inj_folder, classify, parame, phy, vel, rho, dm_spectrum
+        ) for ii, jj, r, theta in tqdm(tasks, desc="Computing DM integral", unit="task")
+    )
+
+    print(f"Total computation time: {time.time() - start_time:.2f} seconds")
+
+if __name__ == "__main__":
+    mDM = 10
+    sigv = 1e-28
+    spec = 'e'
+    calculatefe(mDM, sigv, spec)
